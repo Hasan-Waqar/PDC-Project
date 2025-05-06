@@ -473,8 +473,8 @@ int main() {
     cout << "Graph loading time:          " << graphLoadingTime << " ms" << endl;
     cout << "Initial SSSP computation:    " << initialSSSPTime << " ms" << endl;
     cout << "Total dynamic updates:       " << totalUpdateTime << " ms" << endl;
-    cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
-    cout<<"Total time of execution is "<<megatime<<" s"<<endl;
+ //   cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
+   // cout<<"Total time of execution is "<<megatime<<" s"<<endl;
 
     return 0;
 }
