@@ -22,6 +22,7 @@ struct Edge {
 };
 
 // Read graph
+//READ GRAPH
 void readGraph(const string& filename, int& numVertices, long long& numEdges,
                unordered_map<int, int>& idMap, vector<pair<int, int>>& edgeList) {
     ifstream file(filename.c_str());
@@ -527,7 +528,7 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
         cout << "Reachable vertices: " << totalVertices << endl;
     }
 }
-
+//MAIN FUNCTION 
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     int rank, size;
