@@ -254,3 +254,165 @@ void initializeUpdates(vector<pair<Edge, bool>>& changes, int numVertices,
         existingEdges.insert(edgeKey);
         additions++;
     }
+
+
+     int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0) {
+        cout << "Generated " << changes.size() << " changes: " 
+             << additions << " additions, " << deletions << " deletions, " 
+             << weightUpdates << " weight updates" << endl;
+    }
+}
+
+// Check if edge is in SSSP tree
+bool isEdgeInSSSPTree(const vector<double>& dist, const vector<int>& parent, int u, int v) {
+    return (parent[v] == u && dist[v] < numeric_limits<double>::infinity());
+}
+
+// Parallel incremental SSSP update
+void updateSSSP(const Edge& e, bool isInsertion,
+                vector<vector<pair<int, double>>>& localAdj,
+                const vector<int>& localVertices,
+                unordered_set<int>& ghostVertices,
+                const vector<idx_t>& part, int rank, int size, int numVertices,
+                vector<double>& dist, vector<int>& parent) {
+    // Resize dist and parent if necessary
+    int maxVertex = max(e.u, e.v) + 1;
+    if (maxVertex > static_cast<int>(dist.size())) {
+        dist.resize(maxVertex, numeric_limits<double>::infinity());
+        parent.resize(maxVertex, -1);
+    }
+
+    // Identify affected vertex
+    int x, y;
+    if (dist[e.u] > dist[e.v]) {
+        x = e.u;
+        y = e.v;
+    } else {
+        x = e.v;
+        y = e.u;
+    }
+
+    using P = pair<double, int>;
+    priority_queue<P, vector<P>, greater<P>> pq;
+    unordered_set<int> affected;
+
+    bool isLocal = part[e.u] == rank || part[e.v] == rank;
+    if (isLocal) {
+        if (isInsertion) {
+            if (part[e.u] == rank) {
+                localAdj[e.u].push_back({e.v, e.w});
+                if (part[e.v] != rank) ghostVertices.insert(e.v);
+            }
+            double newDist = dist[y] + e.w;
+            if (dist[x] > newDist && part[x] == rank) {
+                dist[x] = newDist;
+                parent[x] = y;
+                affected.insert(x);
+                pq.push({dist[x], x});
+            }
+        } else {
+            if (part[e.u] == rank && isEdgeInSSSPTree(dist, parent, e.u, e.v)) {
+                if (parent[x] == y) {
+                    dist[x] = numeric_limits<double>::infinity();
+                    parent[x] = -1;
+                    affected.insert(x);
+                    pq.push({dist[x], x});
+                }
+            }
+            if (part[e.u] == rank) {
+                auto& adj = localAdj[e.u];
+                adj.erase(remove_if(adj.begin(), adj.end(),
+                                   [v = e.v](const auto& p) { return p.first == v; }),
+                         adj.end());
+            }
+        }
+    }
+
+    vector<vector<pair<int, double>>> sendBuffers(size);
+    vector<vector<pair<int, double>>> recvBuffers(size);
+
+    bool globalChanges = true;
+    while (globalChanges) {
+        globalChanges = false;
+
+        while (!pq.empty()) {
+            double d = pq.top().first;
+            int z = pq.top().second;
+            pq.pop();
+            if (affected.find(z) == affected.end()) continue;
+            affected.erase(z);
+
+            for (const auto& [n, w] : localAdj[z]) {
+                double newDist = (dist[z] == numeric_limits<double>::infinity())
+                               ? numeric_limits<double>::infinity()
+                               : dist[z] + w;
+                if (dist[n] > newDist) {
+                    dist[n] = newDist;
+                    parent[n] = z;
+                    if (part[n] == rank || ghostVertices.count(n)) {
+                        affected.insert(n);
+                        pq.push({dist[n], n});
+                        globalChanges = true;
+                    }
+                }
+            }
+        }
+
+        // Collect updates for ghost vertices
+        for (int p = 0; p < size; ++p) {
+            sendBuffers[p].clear();
+        }
+        for (int v = 0; v < numVertices; ++v) {
+            if (affected.count(v) && ghostVertices.count(v)) {
+                int targetRank = part[v];
+                sendBuffers[targetRank].push_back({v, dist[v]});
+            }
+        }
+
+        // Communicate updates
+        vector<MPI_Request> requests;
+        for (int p = 0; p < size; ++p) {
+            if (p == rank) continue;
+            int count = sendBuffers[p].size();
+            MPI_Request req;
+            MPI_Isend(&count, 1, MPI_INT, p, 0, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
+            if (count > 0) {
+                MPI_Isend(sendBuffers[p].data(), count * sizeof(pair<int, double>),
+                          MPI_BYTE, p, 1, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
+            }
+        }
+
+        for (int p = 0; p < size; ++p) {
+            if (p == rank) continue;
+            int count;
+            MPI_Recv(&count, 1, MPI_INT, p, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (count > 0) {
+                recvBuffers[p].resize(count);
+                MPI_Recv(recvBuffers[p].data(), count * sizeof(pair<int, double>),
+                         MPI_BYTE, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                for (const auto& [v, newDist] : recvBuffers[p]) {
+                    if (newDist < dist[v]) {
+                        dist[v] = newDist;
+                        parent[v] = -1; // Parent may be in another partition
+                        if (part[v] == rank) {
+                            affected.insert(v);
+                            pq.push({dist[v], v});
+                            globalChanges = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+
+        int localChanges = globalChanges ? 1 : 0;
+        int globalFlag;
+        MPI_Allreduce(&localChanges, &globalFlag, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        globalChanges = globalFlag > 0;
+    }
+}
