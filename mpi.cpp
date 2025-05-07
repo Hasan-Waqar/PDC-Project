@@ -52,13 +52,6 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
             vertices.insert(v);
             edgeList.push_back({u, v});
             edgesRead++;
-            int rank;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (edgesRead % 1000000 == 0 && rank == 0) {
-                cout << "Scanned " << edgesRead << " edges..." << endl;
-            }
-        } else {
-            cerr << "Warning: Skipping malformed line: " << line << endl;
         }
     }
     file.close();
@@ -84,8 +77,10 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (rank == 0) {
-        cout << "Detected " << numVertices << " nodes (" << vertices.size() << " unique vertices)" << endl;
-        cout << "Read " << edgesRead << " edges" << endl;
+        cout << "Graph Statistics:" << endl;
+        cout << "----------------" << endl;
+        cout << "Vertices: " << numVertices << endl;
+        cout << "Edges: " << edgesRead << endl;
     }
 }
 
@@ -538,8 +533,11 @@ int main(int argc, char* argv[]) {
     string graphFile = argc > 1 ? argv[1] : "data.txt";
     string partitionFile = "partition.txt";
 
-    double megaStart = MPI_Wtime(); // Total execution time start
+    double megaStart = MPI_Wtime();
     double start, end;
+    double graphLoadingTime = 0.0;
+    double initialSSSPTime = 0.0;
+    double totalUpdateTime = 0.0;
 
     // Time graph loading
     if (rank == 0) {
@@ -603,8 +601,7 @@ int main(int argc, char* argv[]) {
 
     if (rank == 0) {
         end = MPI_Wtime();
-        double graphLoadingTime = (end - start) * 1000.0; // Convert to ms
-        cout << "Graph loading time: " << graphLoadingTime << " ms" << endl;
+        graphLoadingTime = (end - start) * 1000.0;
     }
 
     vector<idx_t> xadj, adjncy, part;
@@ -674,18 +671,16 @@ int main(int argc, char* argv[]) {
         start = MPI_Wtime();
     }
 
-    // Initial SSSP from source vertex 0
     computeInitialSSSP(localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent, 0);
 
     if (rank == 0) {
         end = MPI_Wtime();
-        double initialSSSPTime = (end - start) * 1000.0; // Convert to ms
-        cout << "Initial SSSP computation time: " << initialSSSPTime << " ms" << endl;
+        initialSSSPTime = (end - start) * 1000.0;
     }
 
     // Process updates with timing
     int changeIndex = 1;
-    double totalUpdateTime = 0.0;
+    totalUpdateTime = 0.0;
     for (const auto& change : changes) {
         if (rank == 0) {
             start = MPI_Wtime();
@@ -695,22 +690,9 @@ int main(int argc, char* argv[]) {
 
         if (rank == 0) {
             end = MPI_Wtime();
-            double updateDuration = (end - start) * 1000.0; // Convert to ms
-            totalUpdateTime += updateDuration;
-
-            if (changeIndex % 10000 == 0 || changeIndex == 1 || changeIndex == changes.size()) {
-                cout << "\n---------------------------------" << endl;
-                cout << "Change " << changeIndex << ":" << endl;
-                cout << "Update time: " << updateDuration << " ms" << endl;
-            }
+            totalUpdateTime += (end - start) * 1000.0;
         }
         changeIndex++;
-    }
-
-    if (rank == 0) {
-        cout << "\nDynamic Updates Summary:" << endl;
-        cout << "Total update time: " << totalUpdateTime << " ms" << endl;
-        cout << "Average update time: " << totalUpdateTime / changes.size() << " ms" << endl;
     }
 
     // Gather distances to rank 0
@@ -779,14 +761,16 @@ int main(int argc, char* argv[]) {
     // Final execution time summary
     if (rank == 0) {
         double megaEnd = MPI_Wtime();
-        double totalExecutionTime = (megaEnd - megaStart) * 1000000.0; // Convert to microseconds
-        cout << "\nFinal Execution Time Summary:" << endl;
-        cout << "-----------------------------" << endl;
-        cout << "Graph loading time:          " << (end - start) * 1000.0 << " ms" << endl;
-        cout << "Initial SSSP computation:    " << (end - start) * 1000.0 << " ms" << endl;
-        cout << "Total dynamic updates:       " << totalUpdateTime << " ms" << endl;
-       // cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
-        //cout << "Total time of execution is   " << totalExecutionTime << " s" << endl;
+        double totalExecutionTime = (megaEnd - megaStart) * 1000.0;
+        
+        cout << "\nPerformance Summary:" << endl;
+        cout << "------------------" << endl;
+        cout << "Graph Loading:     " << graphLoadingTime << " ms" << endl;
+        cout << "Initial SSSP:      " << initialSSSPTime << " ms" << endl;
+        cout << "Total Updates:     " << totalUpdateTime << " ms" << endl;
+        cout << "Avg Update Time:   " << totalUpdateTime / changes.size() << " ms" << endl;
+        cout << "Total Runtime:     " << totalExecutionTime << " ms" << endl;
+        cout << "------------------" << endl;
     }
 
     MPI_Finalize();

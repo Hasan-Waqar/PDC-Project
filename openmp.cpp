@@ -117,8 +117,10 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
     numEdges = edgesRead;
 
     if (rank == 0) {
-        cout << "Detected " << numVertices << " nodes (" << vertices.size() << " unique vertices)" << endl;
-        cout << "Read " << edgesRead << " edges" << endl;
+        cout << "Graph Statistics:" << endl;
+        cout << "----------------" << endl;
+        cout << "Vertices: " << numVertices << endl;
+        cout << "Edges: " << edgesRead << endl;
     }
 }
 
@@ -865,28 +867,19 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
 }
 
 int main(int argc, char* argv[]) {
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Set number of OpenMP threads based on available hardware
-    #pragma omp parallel
-    {
-        #pragma omp master
-        {
-            if (rank == 0) {
-                cout << "Number of OpenMP threads per MPI process: " << omp_get_num_threads() << endl;
-            }
-        }
-    }
-
     string graphFile = argc > 1 ? argv[1] : "data.txt";
     string partitionFile = "partition.txt";
 
-    double megaStart = MPI_Wtime(); // Total execution time start
+    double megaStart = MPI_Wtime();
     double start, end;
+    double graphLoadingTime = 0.0;
+    double initialSSSPTime = 0.0;
+    double totalUpdateTime = 0.0;
 
     // Time graph loading
     if (rank == 0) {
@@ -962,8 +955,7 @@ int main(int argc, char* argv[]) {
 
     if (rank == 0) {
         end = MPI_Wtime();
-        double graphLoadingTime = (end - start) * 1000.0; // Convert to ms
-        cout << "Graph loading time: " << graphLoadingTime << " ms" << endl;
+        graphLoadingTime = (end - start) * 1000.0;
     }
 
     vector<idx_t> xadj, adjncy, part;
@@ -1037,18 +1029,16 @@ int main(int argc, char* argv[]) {
         start = MPI_Wtime();
     }
 
-    // Initial SSSP from source vertex 0
     computeInitialSSSP(localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent, 0);
 
     if (rank == 0) {
         end = MPI_Wtime();
-        double initialSSSPTime = (end - start) * 1000.0; // Convert to ms
-        cout << "Initial SSSP computation time: " << initialSSSPTime << " ms" << endl;
+        initialSSSPTime = (end - start) * 1000.0;
     }
 
     // Process updates with timing
     int changeIndex = 1;
-    double totalUpdateTime = 0.0;
+    totalUpdateTime = 0.0;
     for (const auto& change : changes) {
         if (rank == 0) {
             start = MPI_Wtime();
@@ -1058,119 +1048,24 @@ int main(int argc, char* argv[]) {
 
         if (rank == 0) {
             end = MPI_Wtime();
-            double updateDuration = (end - start) * 1000.0; // Convert to ms
-            totalUpdateTime += updateDuration;
-
-            if (changeIndex % 10000 == 0 || changeIndex == 1 || changeIndex == changes.size()) {
-                cout << "\n---------------------------------" << endl;
-                cout << "Change " << changeIndex << ":" << endl;
-                cout << "Update time: " << updateDuration << " ms" << endl;
-            }
+            totalUpdateTime += (end - start) * 1000.0;
         }
         changeIndex++;
-    }
-
-    if (rank == 0) {
-        cout << "\nDynamic Updates Summary:" << endl;
-        cout << "Total update time: " << totalUpdateTime << " ms" << endl;
-        cout << "Average update time: " << totalUpdateTime / changes.size() << " ms" << endl;
-    }
-
-    // Gather distances to rank 0
-    vector<double> globalDist;
-    if (rank == 0) {
-        globalDist.resize(numVertices, numeric_limits<double>::infinity());
-    }
-
-    // Prepare local distances
-    vector<int> sendVertices;
-    vector<double> sendDistances;
-    
-    // Use OpenMP for this gathering operation
-    #pragma omp parallel
-    {
-        vector<int> thread_sendVertices;
-        vector<double> thread_sendDistances;
-        
-        #pragma omp for nowait
-        for (size_t i = 0; i < localVertices.size(); i++) {
-            int v = localVertices[i];
-            if (dist[v] != numeric_limits<double>::infinity()) {
-                thread_sendVertices.push_back(v);
-                thread_sendDistances.push_back(dist[v]);
-            }
-        }
-        
-        #pragma omp critical
-        {
-            sendVertices.insert(sendVertices.end(), thread_sendVertices.begin(), thread_sendVertices.end());
-            sendDistances.insert(sendDistances.end(), thread_sendDistances.begin(), thread_sendDistances.end());
-        }
-    }
-    
-    int localDistCount = sendVertices.size();
-
-    // Gather distance counts
-    vector<int> distCounts(size);
-    MPI_Gather(&localDistCount, 1, MPI_INT, distCounts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-
-    // Prepare for MPI_Gatherv
-    vector<int> recvCounts(size), displs(size);
-    int totalRecv = 0;
-    if (rank == 0) {
-        for (int p = 0; p < size; ++p) {
-            recvCounts[p] = distCounts[p];
-            displs[p] = totalRecv;
-            totalRecv += distCounts[p];
-        }
-    }
-
-    // Gather vertices
-    vector<int> allVertices(totalRecv);
-    MPI_Gatherv(sendVertices.data(), localDistCount, MPI_INT,
-                allVertices.data(), recvCounts.data(), displs.data(), MPI_INT,
-                0, MPI_COMM_WORLD);
-
-    // Gather distances
-    vector<double> allDistances(totalRecv);
-    MPI_Gatherv(sendDistances.data(), localDistCount, MPI_DOUBLE,
-                allDistances.data(), recvCounts.data(), displs.data(), MPI_DOUBLE,
-                0, MPI_COMM_WORLD);
-
-    // Process received distances
-    if (rank == 0) {
-        #pragma omp parallel for
-        for (int i = 0; i < totalRecv; ++i) {
-            int v = allVertices[i];
-            double d = allDistances[i];
-            #pragma omp critical
-            {
-                globalDist[v] = min(globalDist[v], d);
-            }
-        }
-
-        // Write distances
-        ofstream out("distances.txt");
-        for (int v = 0; v < numVertices; ++v) {
-            if (globalDist[v] != numeric_limits<double>::infinity()) {
-                out << v << " " << globalDist[v] << endl;
-            }
-        }
-        out.close();
-        cout << "Distances saved to distances.txt" << endl;
     }
 
     // Final execution time summary
     if (rank == 0) {
         double megaEnd = MPI_Wtime();
-        double totalExecutionTime = (megaEnd - megaStart) * 1000000.0; // Convert to microseconds
-        cout << "\nFinal Execution Time Summary:" << endl;
-        cout << "-----------------------------" << endl;
-        cout << "Graph loading time:          " << (end - start) * 1000.0 << " ms" << endl;
-        cout << "Initial SSSP computation:    " << (end - start) * 1000.0 << " ms" << endl;
-        cout << "Total dynamic updates:       " << totalUpdateTime << " ms" << endl;
-       // cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
-        //cout << "Total time of execution is   " << totalExecutionTime << " s" << endl;
+        double totalExecutionTime = (megaEnd - megaStart) * 1000.0;
+        
+        cout << "\nPerformance Summary:" << endl;
+        cout << "------------------" << endl;
+        cout << "Graph Loading:     " << graphLoadingTime << " ms" << endl;
+        cout << "Initial SSSP:      " << initialSSSPTime << " ms" << endl;
+        cout << "Total Updates:     " << totalUpdateTime << " ms" << endl;
+        cout << "Avg Update Time:   " << totalUpdateTime / changes.size() << " ms" << endl;
+        cout << "Total Runtime:     " << totalExecutionTime << " ms" << endl;
+        cout << "------------------" << endl;
     }
 
     MPI_Finalize();

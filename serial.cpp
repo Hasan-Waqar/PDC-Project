@@ -236,8 +236,8 @@ void updateSSSP(Graph& G, SSSPTree& T, const Edge& e, bool isInsertion) {
 }
 
 // Read graph from file, handling sparse vertex IDs and storing edge list
-Graph readGraph(const string& filename, int& expectedNodes, long long& expectedEdges, 
-                unordered_map<int, int>& idMap, vector<pair<int, int> >& edgeList) {
+void readGraph(const string& filename, int& numVertices, long long& numEdges,
+               unordered_map<int, int>& idMap, vector<pair<int, int>>& edgeList) {
     ifstream file(filename.c_str());
     if (!file.is_open()) {
         cerr << "Error: Could not open " << filename << endl;
@@ -248,8 +248,9 @@ Graph readGraph(const string& filename, int& expectedNodes, long long& expectedE
     long long edgesRead = 0;
     unordered_set<int> vertices;
     edgeList.clear();
+    int expectedNodes = 0;
+    long long expectedEdges = 0;
 
-    // First pass: Collect unique vertices and edges
     while (getline(file, line)) {
         if (line.empty() || line[0] == '#') {
             if (line.find("Nodes:") != string::npos) {
@@ -262,13 +263,8 @@ Graph readGraph(const string& filename, int& expectedNodes, long long& expectedE
         if (ss >> u >> v) {
             vertices.insert(u);
             vertices.insert(v);
-            edgeList.push_back(pair<int, int>(u, v));
+            edgeList.push_back({u, v});
             edgesRead++;
-            if (edgesRead % 1000000 == 0) {
-                cout << "Scanned " << edgesRead << " edges..." << endl;
-            }
-        } else {
-            cerr << "Warning: Skipping malformed line: " << line << endl;
         }
     }
     file.close();
@@ -278,203 +274,182 @@ Graph readGraph(const string& filename, int& expectedNodes, long long& expectedE
         exit(1);
     }
 
-    // Create contiguous vertex IDs
-    int numVertices = vertices.size();
+    numVertices = vertices.size();
     int newId = 0;
-    for (unordered_set<int>::iterator v = vertices.begin(); v != vertices.end(); ++v) {
-        idMap[*v] = newId++;
+    for (auto v : vertices) {
+        idMap[v] = newId++;
     }
 
-    // Initialize graph with actual number of vertices
-    Graph G(numVertices);
-    cout << "Detected " << numVertices << " nodes (" << vertices.size() << " unique vertices)" << endl;
-    cout << "Read " << edgesRead << " edges in first pass" << endl;
-    if (expectedNodes > 0 && numVertices != expectedNodes) {
-        cout << "Note: Detected nodes (" << numVertices << ") differ from header nodes (" << expectedNodes << "). Using unique vertex count." << endl;
-    }
-    if (expectedEdges > 0 && edgesRead != expectedEdges) {
-        cout << "Warning: Expected " << expectedEdges << " edges, read " << edgesRead << endl;
+    for (auto& e : edgeList) {
+        e.first = idMap[e.first];
+        e.second = idMap[e.second];
     }
 
-    // Second pass: Add edges with remapped IDs
-    for (vector<pair<int, int> >::iterator edge = edgeList.begin(); edge != edgeList.end(); ++edge) {
-        int u = idMap[edge->first];
-        int v = idMap[edge->second];
-        G.addEdge(u, v, 1.0);
-    }
+    numEdges = edgesRead;
 
-    return G;
+    cout << "Graph Statistics:" << endl;
+    cout << "----------------" << endl;
+    cout << "Vertices: " << numVertices << endl;
+    cout << "Edges: " << edgesRead << endl;
 }
 
-int main() {
-    string filename = "data.txt";
-    cout << "Reading graph from " << filename << "..." << endl;
-
-    // Time graph loading
-    auto megastart = chrono::high_resolution_clock::now();
-    auto start = chrono::high_resolution_clock::now();
-    int expectedNodes = 0;
-    long long expectedEdges = 0;
-    unordered_map<int, int> idMap;
-    vector<pair<int, int> > edgeList;
-    Graph G = readGraph(filename, expectedNodes, expectedEdges, idMap, edgeList);
-    auto end = chrono::high_resolution_clock::now();
-    auto duration = chrono::duration_cast<chrono::microseconds>(end - start).count();
-    double graphLoadingTime = duration / 1000.0;
-    cout << "Graph loading time: " << graphLoadingTime << " ms" << endl;
-
-    cout << "\nInitial Graph:" << endl;
-    G.printGraphSummary();
-
-    SSSPTree T(G.numVertices, 0);
-    cout << "\nComputing Initial SSSP:" << endl;
-    // Time initial SSSP
-    start = chrono::high_resolution_clock::now();
-    computeInitialSSSP(G, T);
-    end = chrono::high_resolution_clock::now();
-    duration = chrono::duration_cast<chrono::microseconds>(end - start).count();
-    double initialSSSPTime = duration / 1000.0;
-    cout << "Initial SSSP computation time: " << initialSSSPTime << " ms" << endl;
-    T.printTree();
-
-    // Initialize random number generator
-    srand(time(0));
-
-    // Dynamic changes: 100,000 operations
-    vector<pair<Edge, bool> > changes;
+// Initialize updates (100 random operations)
+void initializeUpdates(vector<pair<Edge, bool>>& changes, int numVertices,
+                      const vector<pair<int, int>>& edgeList) {
+    changes.clear();
     changes.reserve(100);
-    unordered_set<long long> existingEdges; // Track edges to avoid duplicates (u,v as u*numVertices+v)
-    for (vector<pair<int, int> >::iterator edge = edgeList.begin(); edge != edgeList.end(); ++edge) {
-        int u = idMap[edge->first];
-        int v = idMap[edge->second];
-        existingEdges.insert(static_cast<long long>(u) * G.numVertices + v);
+    unordered_set<long long> existingEdges;
+    for (const auto& edge : edgeList) {
+        long long edgeKey = static_cast<long long>(edge.first) * numVertices + edge.second;
+        existingEdges.insert(edgeKey);
     }
 
     int targetChanges = 100;
     int additions = 0, deletions = 0, weightUpdates = 0;
-    vector<int> vertices;
-    for (unordered_map<int, int>::iterator it = idMap.begin(); it != idMap.end(); ++it) {
-        vertices.push_back(it->second);
+    vector<int> vertices(numVertices);
+    for (int i = 0; i < numVertices; ++i) {
+        vertices[i] = i;
     }
 
+    srand(time(0));
     for (int i = 0; i < targetChanges; ++i) {
-        // Choose operation: 0=addition, 1=deletion, 2=weight update
         int op = rand() % 3;
         int u, v;
         double w = (rand() % 95 + 5) / 10.0; // Random weight 0.5 to 10.0
         long long edgeKey;
 
-        if (op == 0 && additions < 33) { // Addition
-            do {
-                u = vertices[rand() % vertices.size()];
-                v = vertices[rand() % vertices.size()];
-                if (u != v) { // Avoid self-loops
-                    edgeKey = static_cast<long long>(u) * G.numVertices + v;
-                }
-            } while (u == v || existingEdges.find(edgeKey) != existingEdges.end());
-            changes.push_back(pair<Edge, bool>(Edge(u, v, w), true));
-            existingEdges.insert(edgeKey);
-            additions++;
-        } else if (op == 1 && deletions < 33 && !edgeList.empty()) { // Deletion
-            int idx = rand() % edgeList.size();
-            u = idMap[edgeList[idx].first];
-            v = idMap[edgeList[idx].second];
-            edgeKey = static_cast<long long>(u) * G.numVertices + v;
-            if (existingEdges.find(edgeKey) != existingEdges.end()) {
-                changes.push_back(pair<Edge, bool>(Edge(u, v, 1.0), false));
-                existingEdges.erase(edgeKey);
-                deletions++;
-            }
-        } else if (weightUpdates < 33 && !edgeList.empty()) { // Weight update (delete + add)
-            int idx = rand() % edgeList.size();
-            u = idMap[edgeList[idx].first];
-            v = idMap[edgeList[idx].second];
-            edgeKey = static_cast<long long>(u) * G.numVertices + v;
-            if (existingEdges.find(edgeKey) != existingEdges.end()) {
-                changes.push_back(pair<Edge, bool>(Edge(u, v, 1.0), false)); // Delete
-                existingEdges.erase(edgeKey);
-                changes.push_back(pair<Edge, bool>(Edge(u, v, w), true));   // Add with new weight
-                existingEdges.insert(edgeKey);
-                weightUpdates += 2; // Counts as two changes
-                i++; // Skip next iteration since we added two changes
-            }
-        } else {
-            // Fallback to addition if deletion/weight update not possible
+        if (op == 0 && additions < targetChanges/3) { // Addition
             do {
                 u = vertices[rand() % vertices.size()];
                 v = vertices[rand() % vertices.size()];
                 if (u != v) {
-                    edgeKey = static_cast<long long>(u) * G.numVertices + v;
+                    edgeKey = static_cast<long long>(u) * numVertices + v;
                 }
             } while (u == v || existingEdges.find(edgeKey) != existingEdges.end());
-            changes.push_back(pair<Edge, bool>(Edge(u, v, w), true));
+            changes.push_back({Edge{u, v, w}, true});
+            existingEdges.insert(edgeKey);
+            additions++;
+        } else if (op == 1 && deletions < targetChanges/3 && !edgeList.empty()) { // Deletion
+            int idx = rand() % edgeList.size();
+            u = edgeList[idx].first;
+            v = edgeList[idx].second;
+            edgeKey = static_cast<long long>(u) * numVertices + v;
+            if (existingEdges.find(edgeKey) != existingEdges.end()) {
+                changes.push_back({Edge{u, v, 1.0}, false});
+                existingEdges.erase(edgeKey);
+                deletions++;
+            }
+        } else if (weightUpdates < targetChanges/3 && !edgeList.empty()) { // Weight update
+            int idx = rand() % edgeList.size();
+            u = edgeList[idx].first;
+            v = edgeList[idx].second;
+            edgeKey = static_cast<long long>(u) * numVertices + v;
+            if (existingEdges.find(edgeKey) != existingEdges.end()) {
+                changes.push_back({Edge{u, v, 1.0}, false}); // Delete
+                existingEdges.erase(edgeKey);
+                changes.push_back({Edge{u, v, w}, true});   // Add with new weight
+                existingEdges.insert(edgeKey);
+                weightUpdates += 2;
+                i++;
+            }
+        } else {
+            do {
+                u = vertices[rand() % vertices.size()];
+                v = vertices[rand() % vertices.size()];
+                if (u != v) {
+                    edgeKey = static_cast<long long>(u) * numVertices + v;
+                }
+            } while (u == v || existingEdges.find(edgeKey) != existingEdges.end());
+            changes.push_back({Edge{u, v, w}, true});
             existingEdges.insert(edgeKey);
             additions++;
         }
-
-        // For small graphs, break early if no more valid operations
-        if (G.numVertices <= 6 && existingEdges.size() >= static_cast<unsigned long>(G.numVertices * (G.numVertices - 1))) {
-            break;
-        }
     }
 
-    // Adjust changes to exactly 100,000 if needed
-    while (changes.size() < 100000 && additions < 33333) {
-        int u, v;
-        long long edgeKey;
-        double w = (rand() % 95 + 5) / 10.0;
-        do {
-            u = vertices[rand() % vertices.size()];
-            v = vertices[rand() % vertices.size()];
-            if (u != v) {
-                edgeKey = static_cast<long long>(u) * G.numVertices + v;
-            }
-        } while (u == v || existingEdges.find(edgeKey) != existingEdges.end());
-        changes.push_back(pair<Edge, bool>(Edge(u, v, w), true));
-        existingEdges.insert(edgeKey);
-        additions++;
-    }
+    cout << "Generated " << changes.size() << " changes: " 
+         << additions << " additions, " << deletions << " deletions, " 
+         << weightUpdates << " weight updates" << endl;
+}
 
-    cout << "\nApplying Dynamic Operations (" << changes.size() << " changes: " 
-         << additions << " additions, " << deletions << " deletions, " << weightUpdates << " weight updates):" << endl;
-    int changeIndex = 1;
+int main(int argc, char* argv[]) {
+    string graphFile = argc > 1 ? argv[1] : "data.txt";
+    string partitionFile = "partition.txt";
+
+    auto megaStart = chrono::high_resolution_clock::now();
+    auto start = chrono::high_resolution_clock::now();
+    auto end = chrono::high_resolution_clock::now();
+    double graphLoadingTime = 0.0;
+    double initialSSSPTime = 0.0;
     double totalUpdateTime = 0.0;
-    for (vector<pair<Edge, bool> >::iterator change = changes.begin(); change != changes.end(); ++change) {
-        // Time individual update
-        auto startUpdate = chrono::high_resolution_clock::now();
-        updateSSSP(G, T, change->first, change->second);
-        auto endUpdate = chrono::high_resolution_clock::now();
-        auto updateDuration = chrono::duration_cast<chrono::microseconds>(endUpdate - startUpdate).count();
-        totalUpdateTime += updateDuration / 1000.0;
 
-        if (changeIndex % 10000 == 0 || changeIndex == 1 || changeIndex == changes.size()) {
-            cout << "\n---------------------------------" << endl;
-            cout << "Change " << changeIndex << ":" << endl;
-            cout << "Update time: " << updateDuration / 1000.0 << " ms" << endl;
-            cout << "\nSSSP Tree After Update:" << endl;
-            T.printTree();
-            cout << "\nGraph After Update:" << endl;
-            G.printGraphSummary();
-        }
+    // Time graph loading
+    start = chrono::high_resolution_clock::now();
+
+    int numVertices = 0;
+    long long numEdges = 0;
+    unordered_map<int, int> idMap;
+    vector<pair<int, int>> edgeList;
+
+    readGraph(graphFile, numVertices, numEdges, idMap, edgeList);
+
+    end = chrono::high_resolution_clock::now();
+    graphLoadingTime = chrono::duration_cast<chrono::microseconds>(end - start).count() / 1000.0;
+
+    // Initialize graph
+    Graph G(numVertices);
+    for (const auto& edge : edgeList) {
+        G.addEdge(edge.first, edge.second, 1.0);
+    }
+
+    // Initialize SSSP tree
+    SSSPTree T(G.numVertices, 0);
+
+    // Time initial SSSP
+    start = chrono::high_resolution_clock::now();
+
+    computeInitialSSSP(G, T);
+
+    end = chrono::high_resolution_clock::now();
+    initialSSSPTime = chrono::duration_cast<chrono::microseconds>(end - start).count() / 1000.0;
+
+    // Initialize changes
+    vector<pair<Edge, bool>> changes;
+    initializeUpdates(changes, numVertices, edgeList);
+
+    // Process updates with timing
+    int changeIndex = 1;
+    totalUpdateTime = 0.0;
+    for (const auto& change : changes) {
+        start = chrono::high_resolution_clock::now();
+
+        updateSSSP(G, T, change.first, change.second);
+
+        end = chrono::high_resolution_clock::now();
+        totalUpdateTime += chrono::duration_cast<chrono::microseconds>(end - start).count() / 1000.0;
         changeIndex++;
     }
-    auto megaend = chrono::high_resolution_clock::now();
-    auto megatime = chrono::duration_cast<chrono::microseconds>(megaend - megastart).count();
-    cout << "\nDynamic Updates Summary:" << endl;
-    cout << "Total update time: " << totalUpdateTime << " ms" << endl;
-    cout << "Average update time: " << totalUpdateTime / changes.size() << " ms" << endl;
 
-    cout << "\nFinal Graph:" << endl;
-    G.printGraphSummary();
+    // Write distances
+    ofstream out("distances.txt");
+    for (int v = 0; v < numVertices; ++v) {
+        if (T.dist[v] != numeric_limits<double>::infinity()) {
+            out << v << " " << T.dist[v] << endl;
+        }
+    }
+    out.close();
 
     // Final execution time summary
-    cout << "\nFinal Execution Time Summary:" << endl;
-    cout << "-----------------------------" << endl;
-    cout << "Graph loading time:          " << graphLoadingTime << " ms" << endl;
-    cout << "Initial SSSP computation:    " << initialSSSPTime << " ms" << endl;
-    cout << "Total dynamic updates:       " << totalUpdateTime << " ms" << endl;
- //   cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
-   // cout<<"Total time of execution is "<<megatime<<" s"<<endl;
+    auto megaEnd = chrono::high_resolution_clock::now();
+    double totalExecutionTime = chrono::duration_cast<chrono::microseconds>(megaEnd - megaStart).count() / 1000.0;
+    
+    cout << "\nPerformance Summary:" << endl;
+    cout << "------------------" << endl;
+    cout << "Graph Loading:     " << graphLoadingTime << " ms" << endl;
+    cout << "Initial SSSP:      " << initialSSSPTime << " ms" << endl;
+    cout << "Total Updates:     " << totalUpdateTime << " ms" << endl;
+    cout << "Avg Update Time:   " << totalUpdateTime / changes.size() << " ms" << endl;
+    cout << "Total Runtime:     " << totalExecutionTime << " ms" << endl;
+    cout << "------------------" << endl;
 
     return 0;
 }
