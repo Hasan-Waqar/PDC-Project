@@ -12,7 +12,7 @@
 #include <metis.h>
 #include <cstdlib>
 #include <ctime>
-#include <omp.h>  // Added OpenMP header
+#include <omp.h> // Added OpenMP header
 
 using namespace std;
 
@@ -38,30 +38,62 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
     int expectedNodes = 0;
     long long expectedEdges = 0;
 
+    // Read header first
     while (getline(file, line)) {
-        if (line.empty() || line[0] == '#') {
-            if (line.find("Nodes:") != string::npos) {
-                sscanf(line.c_str(), "# Nodes: %d Edges: %lld", &expectedNodes, &expectedEdges);
-            }
-            continue;
-        }
-        stringstream ss(line);
-        int u, v;
-        if (ss >> u >> v) {
-            vertices.insert(u);
-            vertices.insert(v);
-            edgeList.push_back({u, v});
-            edgesRead++;
-            int rank;
-            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-            if (edgesRead % 1000000 == 0 && rank == 0) {
-                cout << "Scanned " << edgesRead << " edges..." << endl;
-            }
-        } else {
-            cerr << "Warning: Skipping malformed line: " << line << endl;
+        if (line.empty() || line[0] != '#') break;
+        if (line.find("Nodes:") != string::npos) {
+            sscanf(line.c_str(), "# Nodes: %d Edges: %lld", &expectedNodes, &expectedEdges);
         }
     }
+
+    // Pre-allocate vectors if we know the size
+    if (expectedEdges > 0) {
+        edgeList.reserve(expectedEdges);
+    }
+
+    // Read all lines into memory first for parallel processing
+    vector<string> lines;
+    lines.push_back(line); // Add the first non-header line
+    while (getline(file, line)) {
+        lines.push_back(line);
+    }
     file.close();
+
+    // Process edges in parallel using OpenMP
+    #pragma omp parallel
+    {
+        unordered_set<int> local_vertices;
+        vector<pair<int, int>> local_edgeList;
+        local_edgeList.reserve(expectedEdges / omp_get_num_threads() + 1);
+
+        #pragma omp for schedule(dynamic, 10000)
+        for (size_t i = 0; i < lines.size(); i++) {
+            const string& line = lines[i];
+            if (line.empty() || line[0] == '#') continue;
+            
+            stringstream ss(line);
+            int u, v;
+            if (ss >> u >> v) {
+                local_vertices.insert(u);
+                local_vertices.insert(v);
+                local_edgeList.push_back({u, v});
+            }
+        }
+
+        // Merge local results
+        #pragma omp critical
+        {
+            vertices.insert(local_vertices.begin(), local_vertices.end());
+            edgeList.insert(edgeList.end(), local_edgeList.begin(), local_edgeList.end());
+            edgesRead += local_edgeList.size();
+        }
+    }
+
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (rank == 0 && edgesRead % 1000000 == 0) {
+        cout << "Scanned " << edgesRead << " edges..." << endl;
+    }
 
     if (vertices.empty()) {
         cerr << "Error: No valid vertices found in " << filename << endl;
@@ -70,26 +102,13 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
 
     numVertices = vertices.size();
     int newId = 0;
-    // Use OpenMP to parallelize ID mapping creation
-    vector<pair<int, int>> vertex_pairs;
-    vertex_pairs.reserve(vertices.size());
+    idMap.reserve(numVertices);
     for (auto v : vertices) {
-        vertex_pairs.push_back({v, newId++});
-    }
-    
-    #pragma omp parallel
-    {
-        #pragma omp for schedule(static)
-        for (size_t i = 0; i < vertex_pairs.size(); i++) {
-            #pragma omp critical
-            {
-                idMap[vertex_pairs[i].first] = vertex_pairs[i].second;
-            }
-        }
+        idMap[v] = newId++;
     }
 
-    // Parallelize edge list remapping
-    #pragma omp parallel for schedule(dynamic, 1000)
+    // Map edge IDs in parallel with better scheduling
+    #pragma omp parallel for schedule(dynamic, 10000)
     for (size_t i = 0; i < edgeList.size(); i++) {
         edgeList[i].first = idMap[edgeList[i].first];
         edgeList[i].second = idMap[edgeList[i].second];
@@ -97,8 +116,6 @@ void readGraph(const string& filename, int& numVertices, long long& numEdges,
 
     numEdges = edgesRead;
 
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     if (rank == 0) {
         cout << "Detected " << numVertices << " nodes (" << vertices.size() << " unique vertices)" << endl;
         cout << "Read " << edgesRead << " edges" << endl;
@@ -110,20 +127,19 @@ void convertToCSR(const vector<pair<int, int>>& edgeList, int numVertices,
                   vector<idx_t>& xadj, vector<idx_t>& adjncy) {
     vector<vector<int>> adj(numVertices);
     
-    // Parallelize adjacency list creation
+    // Build adjacency lists in parallel
     #pragma omp parallel
     {
-        // Create thread-local adjacency lists to avoid locks
         vector<vector<int>> local_adj(numVertices);
         
-        #pragma omp for schedule(dynamic, 1000)
+        #pragma omp for schedule(dynamic, 10000)
         for (size_t i = 0; i < edgeList.size(); i++) {
             const auto& edge = edgeList[i];
             local_adj[edge.first].push_back(edge.second);
             local_adj[edge.second].push_back(edge.first); // METIS requires undirected
         }
         
-        // Merge thread-local results
+        // Merge local adjacency lists
         #pragma omp critical
         {
             for (int u = 0; u < numVertices; ++u) {
@@ -132,25 +148,31 @@ void convertToCSR(const vector<pair<int, int>>& edgeList, int numVertices,
         }
     }
 
+    // Sort adjacency lists to remove duplicates
+    #pragma omp parallel for schedule(dynamic, 1000)
+    for (int u = 0; u < numVertices; ++u) {
+        sort(adj[u].begin(), adj[u].end());
+        auto it = unique(adj[u].begin(), adj[u].end());
+        adj[u].resize(it - adj[u].begin());
+    }
+
+    // Compute CSR format
     xadj.resize(numVertices + 1);
-    adjncy.clear();
     xadj[0] = 0;
     
-    // Pre-calculate the size of adjncy
-    idx_t total_edges = 0;
+    // Calculate offsets
     for (int u = 0; u < numVertices; ++u) {
-        total_edges += adj[u].size();
+        xadj[u + 1] = xadj[u] + adj[u].size();
     }
-    adjncy.reserve(total_edges);
     
-    // Fill xadj and adjncy
-    idx_t offset = 0;
+    // Allocate and fill adjacency array
+    adjncy.resize(xadj[numVertices]);
+    
+    #pragma omp parallel for schedule(dynamic, 1000)
     for (int u = 0; u < numVertices; ++u) {
-        for (int v : adj[u]) {
-            adjncy.push_back(v);
+        for (size_t j = 0; j < adj[u].size(); ++j) {
+            adjncy[xadj[u] + j] = adj[u][j];
         }
-        offset += adj[u].size();
-        xadj[u + 1] = offset;
     }
 }
 
@@ -193,8 +215,9 @@ void distributeSubgraphs(const vector<pair<int, int>>& edgeList, const vector<id
     localVertices.clear();
     ghostVertices.clear();
 
-    // Parallelize local vertices identification
+    // Identify local vertices in parallel
     vector<bool> isLocalVertex(numVertices, false);
+    
     #pragma omp parallel for schedule(static)
     for (int v = 0; v < numVertices; ++v) {
         if (part[v] == rank) {
@@ -202,55 +225,45 @@ void distributeSubgraphs(const vector<pair<int, int>>& edgeList, const vector<id
         }
     }
     
-    // Collect local vertices
     for (int v = 0; v < numVertices; ++v) {
         if (isLocalVertex[v]) {
             localVertices.push_back(v);
         }
     }
 
-    // Use thread-local containers to avoid critical sections
+    // Process edges and identify ghost vertices in parallel
     vector<unordered_set<int>> thread_ghost_vertices;
-    vector<vector<vector<pair<int, double>>>> thread_local_adj;
-    
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
         int num_threads = omp_get_num_threads();
         
-        // Initialize thread-local containers
+        // Initialize thread-local ghost vertex sets
         #pragma omp single
         {
             thread_ghost_vertices.resize(num_threads);
-            thread_local_adj.resize(num_threads, vector<vector<pair<int, double>>>(numVertices));
         }
         
-        // Divide edge list among threads
-        #pragma omp for schedule(dynamic, 1000)
-        for (size_t i = 0; i < edgeList.size(); ++i) {
-            int u = edgeList[i].first;
-            int v = edgeList[i].second;
+        #pragma omp for schedule(dynamic, 10000)
+        for (size_t i = 0; i < edgeList.size(); i++) {
+            const auto& edge = edgeList[i];
+            int u = edge.first, v = edge.second;
             double w = 1.0; // Default weight
-            
             if (part[u] == rank) {
-                thread_local_adj[thread_id][u].push_back({v, w});
-                if (part[v] != rank) 
+                #pragma omp critical
+                {
+                    localAdj[u].push_back({v, w});
+                }
+                if (part[v] != rank) {
                     thread_ghost_vertices[thread_id].insert(v);
+                }
             }
         }
     }
     
-    // Merge thread-local results
-    for (size_t t = 0; t < thread_ghost_vertices.size(); ++t) {
-        ghostVertices.insert(thread_ghost_vertices[t].begin(), thread_ghost_vertices[t].end());
-        
-        for (int u = 0; u < numVertices; ++u) {
-            if (!thread_local_adj[t][u].empty()) {
-                localAdj[u].insert(localAdj[u].end(), 
-                                 thread_local_adj[t][u].begin(), 
-                                 thread_local_adj[t][u].end());
-            }
-        }
+    // Merge ghost vertices
+    for (const auto& thread_ghosts : thread_ghost_vertices) {
+        ghostVertices.insert(thread_ghosts.begin(), thread_ghosts.end());
     }
 }
 
@@ -262,21 +275,21 @@ void initializeUpdates(vector<pair<Edge, bool>>& changes, int numVertices,
     changes.reserve(NUM_CHANGES);
     unordered_set<long long> existingEdges;
     
-    // Parallelize building existing edges set
+    // Build existing edges map in parallel
     #pragma omp parallel
     {
-        unordered_set<long long> local_existing_edges;
+        unordered_set<long long> thread_existingEdges;
         
-        #pragma omp for schedule(dynamic, 1000)
-        for (size_t i = 0; i < edgeList.size(); ++i) {
+        #pragma omp for schedule(dynamic, 10000)
+        for (size_t i = 0; i < edgeList.size(); i++) {
             const auto& edge = edgeList[i];
             long long edgeKey = static_cast<long long>(edge.first) * numVertices + edge.second;
-            local_existing_edges.insert(edgeKey);
+            thread_existingEdges.insert(edgeKey);
         }
         
         #pragma omp critical
         {
-            existingEdges.insert(local_existing_edges.begin(), local_existing_edges.end());
+            existingEdges.insert(thread_existingEdges.begin(), thread_existingEdges.end());
         }
     }
 
@@ -372,13 +385,20 @@ bool isEdgeInSSSPTree(const vector<double>& dist, const vector<int>& parent, int
     return (parent[v] == u && dist[v] < numeric_limits<double>::infinity());
 }
 
-// Parallel incremental SSSP update with OpenMP
+// Lock for priority queue operations
+omp_lock_t pq_lock;
+
+// Parallel incremental SSSP update
 void updateSSSP(const Edge& e, bool isInsertion,
                 vector<vector<pair<int, double>>>& localAdj,
                 const vector<int>& localVertices,
                 unordered_set<int>& ghostVertices,
                 const vector<idx_t>& part, int rank, int size, int numVertices,
                 vector<double>& dist, vector<int>& parent) {
+    // Initialize the OpenMP lock
+    omp_lock_t pq_lock;
+    omp_init_lock(&pq_lock);
+    
     // Resize dist and parent if necessary
     int maxVertex = max(e.u, e.v) + 1;
     if (maxVertex > static_cast<int>(dist.size())) {
@@ -398,7 +418,7 @@ void updateSSSP(const Edge& e, bool isInsertion,
 
     using P = pair<double, int>;
     priority_queue<P, vector<P>, greater<P>> pq;
-    unordered_set<int> affected;
+    vector<bool> affected(numVertices, false);
 
     bool isLocal = part[e.u] == rank || part[e.v] == rank;
     if (isLocal) {
@@ -414,16 +434,20 @@ void updateSSSP(const Edge& e, bool isInsertion,
             if (dist[x] > newDist && part[x] == rank) {
                 dist[x] = newDist;
                 parent[x] = y;
-                affected.insert(x);
+                affected[x] = true;
+                omp_set_lock(&pq_lock);
                 pq.push({dist[x], x});
+                omp_unset_lock(&pq_lock);
             }
         } else {
             if (part[e.u] == rank && isEdgeInSSSPTree(dist, parent, e.u, e.v)) {
                 if (parent[x] == y) {
                     dist[x] = numeric_limits<double>::infinity();
                     parent[x] = -1;
-                    affected.insert(x);
+                    affected[x] = true;
+                    omp_set_lock(&pq_lock);
                     pq.push({dist[x], x});
+                    omp_unset_lock(&pq_lock);
                 }
             }
             if (part[e.u] == rank) {
@@ -438,103 +462,112 @@ void updateSSSP(const Edge& e, bool isInsertion,
         }
     }
 
+    // Pre-allocate buffers for better performance
     vector<vector<pair<int, double>>> sendBuffers(size);
     vector<vector<pair<int, double>>> recvBuffers(size);
+    for (int p = 0; p < size; ++p) {
+        sendBuffers[p].reserve(numVertices / size);
+        recvBuffers[p].reserve(numVertices / size);
+    }
 
     bool globalChanges = true;
     while (globalChanges) {
         globalChanges = false;
 
-        while (!pq.empty()) {
-            double d = pq.top().first;
-            int z = pq.top().second;
-            pq.pop();
-            if (affected.find(z) == affected.end()) continue;
-            affected.erase(z);
-
-            // Create local copies to avoid data race
-            vector<pair<int, double>> neighbors;
-            for (const auto& neighbor : localAdj[z]) {
-                neighbors.push_back(neighbor);
-            }
-
-            // Process neighbors in parallel
-            #pragma omp parallel
-            {
-                unordered_set<int> thread_affected;
-                vector<P> thread_updates;
-                
-                #pragma omp for nowait
-                for (size_t i = 0; i < neighbors.size(); i++) {
-                    int n = neighbors[i].first;
-                    double w = neighbors[i].second;
-                    
-                    double newDist = (dist[z] == numeric_limits<double>::infinity())
-                                   ? numeric_limits<double>::infinity()
-                                   : dist[z] + w;
-                                   
-                    if (newDist < dist[n]) {
-                        #pragma omp critical
-                        {
-                            // Check again to avoid race conditions
-                            if (newDist < dist[n]) {
-                                dist[n] = newDist;
-                                parent[n] = z;
-                                
-                                if (part[n] == rank || ghostVertices.count(n)) {
-                                    thread_affected.insert(n);
-                                    thread_updates.push_back({dist[n], n});
-                                    globalChanges = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // Merge thread results
-                #pragma omp critical
-                {
-                    affected.insert(thread_affected.begin(), thread_affected.end());
-                    for (const auto& update : thread_updates) {
-                        pq.push(update);
-                    }
-                }
-            }
-        }
-
-        // Collect updates for ghost vertices in parallel
-        for (int p = 0; p < size; ++p) {
-            sendBuffers[p].clear();
-        }
-        
-        vector<vector<pair<int, double>>> thread_send_buffers(omp_get_max_threads(), vector<pair<int, double>>(size));
-        
+        // Process priority queue in parallel
         #pragma omp parallel
         {
-            int thread_id = omp_get_thread_num();
-            vector<vector<pair<int, double>>> local_send_buffers(size);
-            
-            #pragma omp for schedule(dynamic, 64)
-            for (int v = 0; v < numVertices; ++v) {
-                if (affected.count(v) && ghostVertices.count(v)) {
-                    int targetRank = part[v];
-                    local_send_buffers[targetRank].push_back({v, dist[v]});
+            vector<pair<double, int>> thread_updates;
+            thread_updates.reserve(1000); // Pre-allocate for better performance
+
+            while (true) {
+                P current;
+                bool has_item = false;
+                
+                omp_set_lock(&pq_lock);
+                if (!pq.empty()) {
+                    current = pq.top();
+                    pq.pop();
+                    has_item = true;
+                }
+                omp_unset_lock(&pq_lock);
+                
+                if (!has_item) break;
+                
+                double d = current.first;
+                int u = current.second;
+                
+                if (!affected[u]) continue;
+                affected[u] = false;
+
+                // Process adjacency list in parallel
+                #pragma omp for reduction(||:globalChanges) nowait
+                for (size_t i = 0; i < localAdj[u].size(); i++) {
+                    int v = localAdj[u][i].first;
+                    double w = localAdj[u][i].second;
+                    double newDist = (dist[u] == numeric_limits<double>::infinity())
+                                  ? numeric_limits<double>::infinity()
+                                  : dist[u] + w;
+                    
+                    bool local_update = false;
+                    #pragma omp critical
+                    {
+                        if (newDist < dist[v]) {
+                            dist[v] = newDist;
+                            parent[v] = u;
+                            local_update = true;
+                        }
+                    }
+                    
+                    if (local_update && (part[v] == rank || ghostVertices.count(v))) {
+                        thread_updates.push_back({dist[v], v});
+                        globalChanges = true;
+                    }
                 }
             }
             
-            // Merge thread results
+            // Add thread-local updates to priority queue
+            if (!thread_updates.empty()) {
+                omp_set_lock(&pq_lock);
+                for (const auto& update : thread_updates) {
+                    pq.push(update);
+                    affected[update.second] = true;
+                }
+                omp_unset_lock(&pq_lock);
+            }
+        }
+
+        // Prepare send buffers in parallel
+        #pragma omp parallel
+        {
+            vector<vector<pair<int, double>>> thread_sendBuffers(size);
+            for (int p = 0; p < size; ++p) {
+                thread_sendBuffers[p].reserve(numVertices / (size * omp_get_num_threads()));
+            }
+            
+            #pragma omp for nowait
+            for (int v = 0; v < numVertices; ++v) {
+                if (affected[v] && ghostVertices.count(v)) {
+                    int targetRank = part[v];
+                    thread_sendBuffers[targetRank].push_back({v, dist[v]});
+                }
+            }
+            
+            // Combine thread-local buffers
             #pragma omp critical
             {
                 for (int p = 0; p < size; ++p) {
                     sendBuffers[p].insert(sendBuffers[p].end(), 
-                                        local_send_buffers[p].begin(), 
-                                        local_send_buffers[p].end());
+                                         thread_sendBuffers[p].begin(), 
+                                         thread_sendBuffers[p].end());
                 }
             }
         }
 
-        // Communicate updates
+        // Optimize communication by using non-blocking sends
         vector<MPI_Request> requests;
+        requests.reserve(2 * (size - 1));
+        
         for (int p = 0; p < size; ++p) {
             if (p == rank) continue;
             int count = sendBuffers[p].size();
@@ -548,6 +581,7 @@ void updateSSSP(const Edge& e, bool isInsertion,
             }
         }
 
+        // Process received updates in parallel
         for (int p = 0; p < size; ++p) {
             if (p == rank) continue;
             int count;
@@ -557,41 +591,39 @@ void updateSSSP(const Edge& e, bool isInsertion,
                 MPI_Recv(recvBuffers[p].data(), count * sizeof(pair<int, double>),
                          MPI_BYTE, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 
-                // Process received data in parallel
                 #pragma omp parallel
                 {
-                    unordered_set<int> thread_affected;
-                    vector<P> thread_updates;
+                    vector<pair<double, int>> thread_updates;
+                    thread_updates.reserve(count / omp_get_num_threads() + 1);
                     
-                    #pragma omp for schedule(dynamic, 64)
+                    #pragma omp for reduction(||:globalChanges) nowait
                     for (int i = 0; i < count; i++) {
                         int v = recvBuffers[p][i].first;
                         double newDist = recvBuffers[p][i].second;
                         
-                        if (newDist < dist[v]) {
-                            #pragma omp critical
-                            {
-                                if (newDist < dist[v]) {
-                                    dist[v] = newDist;
-                                    parent[v] = -1; // Parent may be in another partition
-                                    
-                                    if (part[v] == rank) {
-                                        thread_affected.insert(v);
-                                        thread_updates.push_back({dist[v], v});
-                                        globalChanges = true;
-                                    }
-                                }
+                        bool local_update = false;
+                        #pragma omp critical
+                        {
+                            if (newDist < dist[v]) {
+                                dist[v] = newDist;
+                                parent[v] = -1;
+                                local_update = true;
                             }
+                        }
+                        
+                        if (local_update && part[v] == rank) {
+                            thread_updates.push_back({newDist, v});
+                            globalChanges = true;
                         }
                     }
                     
-                    // Merge thread results
-                    #pragma omp critical
-                    {
-                        affected.insert(thread_affected.begin(), thread_affected.end());
+                    if (!thread_updates.empty()) {
+                        omp_set_lock(&pq_lock);
                         for (const auto& update : thread_updates) {
                             pq.push(update);
+                            affected[update.second] = true;
                         }
+                        omp_unset_lock(&pq_lock);
                     }
                 }
             }
@@ -599,14 +631,22 @@ void updateSSSP(const Edge& e, bool isInsertion,
 
         MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
+        // Clear send buffers for next iteration
+        for (int p = 0; p < size; ++p) {
+            sendBuffers[p].clear();
+        }
+
         int localChanges = globalChanges ? 1 : 0;
         int globalFlag;
         MPI_Allreduce(&localChanges, &globalFlag, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         globalChanges = globalFlag > 0;
     }
+    
+    // Destroy the lock
+    omp_destroy_lock(&pq_lock);
 }
 
-// Compute initial SSSP with OpenMP parallelism
+// Compute initial SSSP (Dijkstra's)
 void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
                        const vector<int>& localVertices,
                        const unordered_set<int>& ghostVertices,
@@ -623,102 +663,120 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
 
     using P = pair<double, int>;
     priority_queue<P, vector<P>, greater<P>> pq;
-    unordered_set<int> visited;
+    vector<bool> visited(numVertices, false);
     if (part[source] == rank) {
         pq.push({0, source});
     }
 
+    // Pre-allocate buffers for better performance
     vector<vector<pair<int, double>>> sendBuffers(size);
     vector<vector<pair<int, double>>> recvBuffers(size);
+    for (int p = 0; p < size; ++p) {
+        sendBuffers[p].reserve(numVertices / size);
+        recvBuffers[p].reserve(numVertices / size);
+    }
 
     bool globalChanges = true;
     while (globalChanges) {
         globalChanges = false;
 
-        while (!pq.empty()) {
-            double d = pq.top().first;
-            int u = pq.top().second;
-            pq.pop();
-            if (visited.count(u)) continue;
-            visited.insert(u);
+        // Process priority queue in parallel
+        #pragma omp parallel
+        {
+            vector<pair<double, int>> thread_updates;
+            thread_updates.reserve(1000); // Pre-allocate for better performance
 
-            // Create a local copy of neighbors to avoid data race
-            vector<pair<int, double>> neighbors;
-            for (const auto& neighbor : localAdj[u]) {
-                neighbors.push_back(neighbor);
-            }
-
-            // Process neighbors in parallel
-            #pragma omp parallel
-            {
-                vector<P> thread_updates;
-                unordered_set<int> thread_visited;
+            while (true) {
+                P current;
+                bool has_item = false;
                 
-                #pragma omp for nowait
-                for (size_t i = 0; i < neighbors.size(); i++) {
-                    int v = neighbors[i].first;
-                    double w = neighbors[i].second;
-                    
+                #pragma omp critical
+                {
+                    if (!pq.empty()) {
+                        current = pq.top();
+                        pq.pop();
+                        has_item = true;
+                    }
+                }
+                
+                if (!has_item) break;
+                
+                double d = current.first;
+                int u = current.second;
+                
+                if (visited[u]) continue;
+                
+                #pragma omp critical
+                {
+                    visited[u] = true;
+                }
+
+                // Process adjacency list in parallel
+                #pragma omp for reduction(||:globalChanges) nowait
+                for (size_t i = 0; i < localAdj[u].size(); i++) {
+                    int v = localAdj[u][i].first;
+                    double w = localAdj[u][i].second;
                     double newDist = dist[u] + w;
-                    bool should_update = false;
                     
+                    bool local_update = false;
                     #pragma omp critical
                     {
-                        if (!visited.count(v) && newDist < dist[v]) {
+                        if (!visited[v] && newDist < dist[v]) {
                             dist[v] = newDist;
                             parent[v] = u;
-                            should_update = true;
+                            local_update = true;
                         }
                     }
                     
-                    if (should_update && (part[v] == rank || ghostVertices.count(v))) {
+                    if (local_update && (part[v] == rank || ghostVertices.count(v))) {
                         thread_updates.push_back({newDist, v});
                         globalChanges = true;
                     }
                 }
-                
-                // Merge thread results
+            }
+            
+            // Add thread-local updates to priority queue
+            if (!thread_updates.empty()) {
                 #pragma omp critical
                 {
                     for (const auto& update : thread_updates) {
                         pq.push(update);
                     }
-                    visited.insert(thread_visited.begin(), thread_visited.end());
                 }
             }
         }
 
         // Prepare send buffers in parallel
-        for (int p = 0; p < size; ++p) {
-            sendBuffers[p].clear();
-        }
-        
-        vector<vector<vector<pair<int, double>>>> thread_send_buffers(omp_get_max_threads(), 
-                                                                    vector<vector<pair<int, double>>>(size));
-        
         #pragma omp parallel
         {
-            int thread_id = omp_get_thread_num();
+            vector<vector<pair<int, double>>> thread_sendBuffers(size);
+            for (int p = 0; p < size; ++p) {
+                thread_sendBuffers[p].reserve(numVertices / (size * omp_get_num_threads()));
+            }
             
-            #pragma omp for schedule(dynamic, 64)
+            #pragma omp for nowait
             for (int v = 0; v < numVertices; ++v) {
-                if (!visited.count(v) && dist[v] != INF && ghostVertices.count(v)) {
+                if (!visited[v] && dist[v] != INF && ghostVertices.count(v)) {
                     int targetRank = part[v];
-                    thread_send_buffers[thread_id][targetRank].push_back({v, dist[v]});
+                    thread_sendBuffers[targetRank].push_back({v, dist[v]});
+                }
+            }
+            
+            // Combine thread-local buffers
+            #pragma omp critical
+            {
+                for (int p = 0; p < size; ++p) {
+                    sendBuffers[p].insert(sendBuffers[p].end(), 
+                                         thread_sendBuffers[p].begin(), 
+                                         thread_sendBuffers[p].end());
                 }
             }
         }
-        
-        // Merge thread results
-        for (int t = 0; t < omp_get_max_threads(); ++t) {
-            for (int p = 0; p < size; ++p) {
-                sendBuffers[p].insert(sendBuffers[p].end(), 
-                                    thread_send_buffers[t][p].begin(), 
-                                    thread_send_buffers[t][p].end());
-            }
-        }
 
+        // Optimize communication by using non-blocking sends
         vector<MPI_Request> requests;
+        requests.reserve(2 * (size - 1));
+        
         for (int p = 0; p < size; ++p) {
             if (p == rank) continue;
             int count = sendBuffers[p].size();
@@ -732,6 +790,7 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
             }
         }
 
+        // Process received updates in parallel
         for (int p = 0; p < size; ++p) {
             if (p == rank) continue;
             int count;
@@ -741,37 +800,38 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
                 MPI_Recv(recvBuffers[p].data(), count * sizeof(pair<int, double>),
                          MPI_BYTE, p, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 
-                // Process received updates in parallel
                 #pragma omp parallel
                 {
-                    vector<P> thread_updates;
+                    vector<pair<double, int>> thread_updates;
+                    thread_updates.reserve(count / omp_get_num_threads() + 1);
                     
-                    #pragma omp for schedule(dynamic, 64)
+                    #pragma omp for reduction(||:globalChanges) nowait
                     for (int i = 0; i < count; i++) {
                         int v = recvBuffers[p][i].first;
                         double newDist = recvBuffers[p][i].second;
                         
-                        bool should_update = false;
+                        bool local_update = false;
                         #pragma omp critical
                         {
-                            if (newDist < dist[v]) {
+                            if (!visited[v] && newDist < dist[v]) {
                                 dist[v] = newDist;
-                                parent[v] = -1; // Parent in another partition
-                                should_update = true;
+                                parent[v] = -1;
+                                local_update = true;
                             }
                         }
                         
-                        if (should_update && part[v] == rank) {
+                        if (local_update && part[v] == rank) {
                             thread_updates.push_back({newDist, v});
                             globalChanges = true;
                         }
                     }
                     
-                    // Merge thread results
-                    #pragma omp critical
-                    {
-                        for (const auto& update : thread_updates) {
-                            pq.push(update);
+                    if (!thread_updates.empty()) {
+                        #pragma omp critical
+                        {
+                            for (const auto& update : thread_updates) {
+                                pq.push(update);
+                            }
                         }
                     }
                 }
@@ -780,266 +840,338 @@ void computeInitialSSSP(const vector<vector<pair<int, double>>>& localAdj,
 
         MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
+        // Clear send buffers for next iteration
+        for (int p = 0; p < size; ++p) {
+            sendBuffers[p].clear();
+        }
+
         int localChanges = globalChanges ? 1 : 0;
         int globalFlag;
         MPI_Allreduce(&localChanges, &globalFlag, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
         globalChanges = globalFlag > 0;
     }
-}
 
-// Print SSSP results (for debugging)
-void printSSSP(const vector<double>& dist, const vector<int>& parent, int source, int rank, int numVertices) {
-    int worldSize;
-    MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
-    
-    for (int r = 0; r < worldSize; ++r) {
-        if (r == rank) {
-            cout << "Process " << rank << " SSSP results from source " << source << ":" << endl;
-            for (int v = 0; v < numVertices; ++v) {
-                if (dist[v] < numeric_limits<double>::infinity()) {
-                    cout << "  Vertex " << v << ": dist = " << dist[v] << ", parent = " << parent[v] << endl;
-                }
-            }
-            cout << flush;
-        }
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-}
-
-// Verify SSSP correctness by comparing with sequential Dijkstra
-bool verifySSSP(const vector<pair<int, int>>& edgeList, const vector<double>& parallelDist, 
-                int numVertices, int source, int rank) {
-    if (rank != 0) return true;
-    
-    cout << "Verifying SSSP results..." << endl;
-    
-    // Build adjacency list for sequential algorithm
-    vector<vector<pair<int, double>>> adj(numVertices);
-    for (const auto& edge : edgeList) {
-        int u = edge.first;
-        int v = edge.second;
-        double w = 1.0; // Default weight
-        adj[u].push_back({v, w});
-        adj[v].push_back({u, w}); // Undirected graph
-    }
-    
-    // Run sequential Dijkstra
-    vector<double> seqDist(numVertices, numeric_limits<double>::infinity());
-    vector<int> seqParent(numVertices, -1);
-    vector<bool> visited(numVertices, false);
-    
-    seqDist[source] = 0;
-    
-    priority_queue<pair<double, int>, vector<pair<double, int>>, greater<pair<double, int>>> pq;
-    pq.push({0, source});
-    
-    while (!pq.empty()) {
-        int u = pq.top().second;
-        pq.pop();
-        
-        if (visited[u]) continue;
-        visited[u] = true;
-        
-        for (const auto& edge : adj[u]) {
-            int v = edge.first;
-            double w = edge.second;
-            
-            if (!visited[v] && seqDist[u] + w < seqDist[v]) {
-                seqDist[v] = seqDist[u] + w;
-                seqParent[v] = u;
-                pq.push({seqDist[v], v});
-            }
-        }
-    }
-    
-    // Compare results
-    bool correct = true;
+    int rankVertices = 0;
+    #pragma omp parallel for reduction(+:rankVertices)
     for (int v = 0; v < numVertices; ++v) {
-        if (abs(seqDist[v] - parallelDist[v]) > 1e-6 && 
-            !(seqDist[v] == numeric_limits<double>::infinity() && 
-              parallelDist[v] == numeric_limits<double>::infinity())) {
-            cout << "Mismatch at vertex " << v << ": sequential = " << seqDist[v] 
-                 << ", parallel = " << parallelDist[v] << endl;
-            correct = false;
-        }
+        if (visited[v]) rankVertices++;
     }
-    
-    if (correct) {
-        cout << "SSSP verification passed!" << endl;
-    } else {
-        cout << "SSSP verification failed!" << endl;
-    }
-    
-    return correct;
-}
 
-// Benchmark function
-void benchmarkSSP(vector<pair<Edge, bool>>& changes, 
-                 vector<vector<pair<int, double>>>& localAdj,
-                 const vector<int>& localVertices,
-                 unordered_set<int>& ghostVertices,
-                 const vector<idx_t>& part, int rank, int size, int numVertices,
-                 vector<double>& dist, vector<int>& parent, int source) {
-    // Time sequential updates
-    double seqTime = 0;
-    MPI_Barrier(MPI_COMM_WORLD);
-    double startSeq = MPI_Wtime();
-    
-    for (const auto& change : changes) {
-        const Edge& e = change.first;
-        bool isInsertion = change.second;
-        
-        // Turn off OpenMP for sequential timing
-        omp_set_num_threads(1);
-        updateSSSP(e, isInsertion, localAdj, localVertices, ghostVertices, 
-                  part, rank, size, numVertices, dist, parent);
-    }
-    
-    MPI_Barrier(MPI_COMM_WORLD);
-    double endSeq = MPI_Wtime();
-    seqTime = endSeq - startSeq;
-    
-    // Reset SSSP
-    computeInitialSSSP(localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent, source);
-    
-    // Time parallel updates
-    double parTime = 0;
-    MPI_Barrier(MPI_COMM_WORLD);
-    double startPar = MPI_Wtime();
-    
-    // Set OpenMP threads to maximum
-    omp_set_num_threads(omp_get_max_threads());
-    
-    for (const auto& change : changes) {
-        const Edge& e = change.first;
-        bool isInsertion = change.second;
-        
-        updateSSSP(e, isInsertion, localAdj, localVertices, ghostVertices, 
-                  part, rank, size, numVertices, dist, parent);
-    }
-    
-    MPI_Barrier(MPI_COMM_WORLD);
-    double endPar = MPI_Wtime();
-    parTime = endPar - startPar;
-    
+    int totalVertices;
+    MPI_Reduce(&rankVertices, &totalVertices, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (rank == 0) {
-        cout << "Sequential update time: " << seqTime << " seconds" << endl;
-        cout << "Parallel update time: " << parTime << " seconds" << endl;
-        cout << "Speedup: " << seqTime / parTime << "x" << endl;
+        cout << "Reachable vertices: " << totalVertices << endl;
     }
 }
 
-// Main function
 int main(int argc, char* argv[]) {
     int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    if (provided < MPI_THREAD_MULTIPLE) {
-        cerr << "Warning: The MPI implementation does not support MPI_THREAD_MULTIPLE" << endl;
-    }
-
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    string filename = "data.txt";
-    int source = 0; // Default source vertex
-
-    if (argc >= 3) {
-        source = atoi(argv[2]);
+    // Set number of OpenMP threads based on available hardware
+    #pragma omp parallel
+    {
+        #pragma omp master
+        {
+            if (rank == 0) {
+                cout << "Number of OpenMP threads per MPI process: " << omp_get_num_threads() << endl;
+            }
+        }
     }
 
-    int numVertices;
-    long long numEdges;
+    string graphFile = argc > 1 ? argv[1] : "data.txt";
+    string partitionFile = "partition.txt";
+
+    double megaStart = MPI_Wtime(); // Total execution time start
+    double start, end;
+
+    // Time graph loading
+    if (rank == 0) {
+        start = MPI_Wtime();
+    }
+
+    int numVertices = 0;
+    long long numEdges = 0;
     unordered_map<int, int> idMap;
     vector<pair<int, int>> edgeList;
 
-    // Timing variables
-    double startTime, endTime;
-    
     if (rank == 0) {
-        cout << "Reading graph from " << filename << endl;
-    }
-    startTime = MPI_Wtime();
-    readGraph(filename, numVertices, numEdges, idMap, edgeList);
-    endTime = MPI_Wtime();
-    if (rank == 0) {
-        cout << "Graph reading completed in " << (endTime - startTime) << " seconds" << endl;
+        readGraph(graphFile, numVertices, numEdges, idMap, edgeList);
     }
 
-    vector<idx_t> xadj, adjncy;
-    if (rank == 0) {
-        cout << "Converting to CSR format for METIS..." << endl;
+    MPI_Bcast(&numVertices, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&numEdges, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+
+    int edgeListSize = edgeList.size();
+    MPI_Bcast(&edgeListSize, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        edgeList.resize(edgeListSize);
     }
-    startTime = MPI_Wtime();
+    vector<int> edgeU(edgeListSize), edgeV(edgeListSize);
+    if (rank == 0) {
+        #pragma omp parallel for
+        for (size_t i = 0; i < edgeList.size(); ++i) {
+            edgeU[i] = edgeList[i].first;
+            edgeV[i] = edgeList[i].second;
+        }
+    }
+    MPI_Bcast(edgeU.data(), edgeListSize, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(edgeV.data(), edgeListSize, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < edgeListSize; ++i) {
+            edgeList[i] = {edgeU[i], edgeV[i]};
+        }
+    }
+
+    int idMapSize = idMap.size();
+    MPI_Bcast(&idMapSize, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    vector<int> idMapKeys, idMapValues;
+    if (rank == 0) {
+        idMapKeys.reserve(idMapSize);
+        idMapValues.reserve(idMapSize);
+        for (const auto& pair : idMap) {
+            idMapKeys.push_back(pair.first);
+            idMapValues.push_back(pair.second);
+        }
+    } else {
+        idMapKeys.resize(idMapSize);
+        idMapValues.resize(idMapSize);
+    }
+    MPI_Bcast(idMapKeys.data(), idMapSize, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(idMapValues.data(), idMapSize, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        idMap.clear();
+        #pragma omp parallel
+        {
+            unordered_map<int, int> thread_idMap;
+            #pragma omp for nowait
+            for (int i = 0; i < idMapSize; ++i) {
+                thread_idMap[idMapKeys[i]] = idMapValues[i];
+            }
+            
+            #pragma omp critical
+            {
+                idMap.insert(thread_idMap.begin(), thread_idMap.end());
+            }
+        }
+    }
+
+    if (rank == 0) {
+        end = MPI_Wtime();
+        double graphLoadingTime = (end - start) * 1000.0; // Convert to ms
+        cout << "Graph loading time: " << graphLoadingTime << " ms" << endl;
+    }
+
+    vector<idx_t> xadj, adjncy, part;
     convertToCSR(edgeList, numVertices, xadj, adjncy);
-    endTime = MPI_Wtime();
-    if (rank == 0) {
-        cout << "CSR conversion completed in " << (endTime - startTime) << " seconds" << endl;
-    }
+    int nparts = size;
+    partitionGraph(numVertices, xadj, adjncy, nparts, part);
 
-    vector<idx_t> part(numVertices);
     if (rank == 0) {
-        cout << "Partitioning graph with METIS into " << size << " parts..." << endl;
-    }
-    startTime = MPI_Wtime();
-    partitionGraph(numVertices, xadj, adjncy, size, part);
-    endTime = MPI_Wtime();
-    if (rank == 0) {
-        cout << "Graph partitioning completed in " << (endTime - startTime) << " seconds" << endl;
+        ofstream out(partitionFile);
+        for (size_t i = 0; i < part.size(); ++i) {
+            out << i << " " << part[i] << endl;
+        }
+        out.close();
+        cout << "Partitioning saved to " << partitionFile << endl;
+
+        vector<int> partSizes(nparts, 0);
+        #pragma omp parallel for
+        for (size_t i = 0; i < part.size(); i++) {
+            #pragma omp atomic
+            partSizes[part[i]]++;
+        }
+        cout << "Partition sizes:" << endl;
+        for (int i = 0; i < nparts; ++i) {
+            cout << "Partition " << i << ": " << partSizes[i] << " vertices" << endl;
+        }
     }
 
     vector<vector<pair<int, double>>> localAdj;
     vector<int> localVertices;
     unordered_set<int> ghostVertices;
+    distributeSubgraphs(edgeList, part, rank, size, numVertices,
+                       localAdj, localVertices, ghostVertices);
 
+    vector<pair<Edge, bool>> changes;
     if (rank == 0) {
-        cout << "Distributing subgraphs to processes..." << endl;
+        initializeUpdates(changes, numVertices, edgeList);
     }
-    startTime = MPI_Wtime();
-    distributeSubgraphs(edgeList, part, rank, size, numVertices, localAdj, localVertices, ghostVertices);
-    endTime = MPI_Wtime();
+    int changesSize = changes.size();
+    MPI_Bcast(&changesSize, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        changes.resize(changesSize);
+    }
+    vector<int> changeU(changesSize), changeV(changesSize);
+    vector<double> changeW(changesSize);
+    vector<char> changeOp(changesSize);
     if (rank == 0) {
-        cout << "Subgraph distribution completed in " << (endTime - startTime) << " seconds" << endl;
-        cout << "Starting with " << localVertices.size() << " local vertices and " 
-             << ghostVertices.size() << " ghost vertices" << endl;
+        #pragma omp parallel for
+        for (size_t i = 0; i < changes.size(); ++i) {
+            changeU[i] = changes[i].first.u;
+            changeV[i] = changes[i].first.v;
+            changeW[i] = changes[i].first.w;
+            changeOp[i] = changes[i].second ? 'I' : 'D';
+        }
+    }
+    MPI_Bcast(changeU.data(), changesSize, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(changeV.data(), changesSize, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(changeW.data(), changesSize, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(changeOp.data(), changesSize, MPI_CHAR, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < changesSize; ++i) {
+            changes[i] = {Edge{changeU[i], changeV[i], changeW[i]}, changeOp[i] == 'I'};
+        }
     }
 
     vector<double> dist;
     vector<int> parent;
 
+    // Time initial SSSP
     if (rank == 0) {
-        cout << "Computing initial SSSP from source " << source << "..." << endl;
-    }
-    startTime = MPI_Wtime();
-    computeInitialSSSP(localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent, source);
-    endTime = MPI_Wtime();
-    if (rank == 0) {
-        cout << "Initial SSSP computation completed in " << (endTime - startTime) << " seconds" << endl;
+        start = MPI_Wtime();
     }
 
-    // Verify SSSP results (optional)
-    if (verifySSSP(edgeList, dist, numVertices, source, rank)) {
-        if (rank == 0) cout << "Initial SSSP computation verified successfully" << endl;
+    // Initial SSSP from source vertex 0
+    computeInitialSSSP(localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent, 0);
+
+    if (rank == 0) {
+        end = MPI_Wtime();
+        double initialSSSPTime = (end - start) * 1000.0; // Convert to ms
+        cout << "Initial SSSP computation time: " << initialSSSPTime << " ms" << endl;
     }
 
-    // Preparing updates
-    vector<pair<Edge, bool>> changes;
-    if (rank == 0) {
-        cout << "Generating random graph updates..." << endl;
-    }
-    startTime = MPI_Wtime();
-    initializeUpdates(changes, numVertices, edgeList);
-    endTime = MPI_Wtime();
-    if (rank == 0) {
-        cout << "Updates generation completed in " << (endTime - startTime) << " seconds" << endl;
+    // Process updates with timing
+    int changeIndex = 1;
+    double totalUpdateTime = 0.0;
+    for (const auto& change : changes) {
+        if (rank == 0) {
+            start = MPI_Wtime();
+        }
+
+        updateSSSP(change.first, change.second, localAdj, localVertices, ghostVertices, part, rank, size, numVertices, dist, parent);
+
+        if (rank == 0) {
+            end = MPI_Wtime();
+            double updateDuration = (end - start) * 1000.0; // Convert to ms
+            totalUpdateTime += updateDuration;
+
+            if (changeIndex % 10000 == 0 || changeIndex == 1 || changeIndex == changes.size()) {
+                cout << "\n---------------------------------" << endl;
+                cout << "Change " << changeIndex << ":" << endl;
+                cout << "Update time: " << updateDuration << " ms" << endl;
+            }
+        }
+        changeIndex++;
     }
 
-    // Benchmark updates
     if (rank == 0) {
-        cout << "Benchmarking incremental SSSP updates..." << endl;
+        cout << "\nDynamic Updates Summary:" << endl;
+        cout << "Total update time: " << totalUpdateTime << " ms" << endl;
+        cout << "Average update time: " << totalUpdateTime / changes.size() << " ms" << endl;
     }
-    benchmarkSSP(changes, localAdj, localVertices, ghostVertices, 
-                part, rank, size, numVertices, dist, parent, source);
+
+    // Gather distances to rank 0
+    vector<double> globalDist;
+    if (rank == 0) {
+        globalDist.resize(numVertices, numeric_limits<double>::infinity());
+    }
+
+    // Prepare local distances
+    vector<int> sendVertices;
+    vector<double> sendDistances;
+    
+    // Use OpenMP for this gathering operation
+    #pragma omp parallel
+    {
+        vector<int> thread_sendVertices;
+        vector<double> thread_sendDistances;
+        
+        #pragma omp for nowait
+        for (size_t i = 0; i < localVertices.size(); i++) {
+            int v = localVertices[i];
+            if (dist[v] != numeric_limits<double>::infinity()) {
+                thread_sendVertices.push_back(v);
+                thread_sendDistances.push_back(dist[v]);
+            }
+        }
+        
+        #pragma omp critical
+        {
+            sendVertices.insert(sendVertices.end(), thread_sendVertices.begin(), thread_sendVertices.end());
+            sendDistances.insert(sendDistances.end(), thread_sendDistances.begin(), thread_sendDistances.end());
+        }
+    }
+    
+    int localDistCount = sendVertices.size();
+
+    // Gather distance counts
+    vector<int> distCounts(size);
+    MPI_Gather(&localDistCount, 1, MPI_INT, distCounts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Prepare for MPI_Gatherv
+    vector<int> recvCounts(size), displs(size);
+    int totalRecv = 0;
+    if (rank == 0) {
+        for (int p = 0; p < size; ++p) {
+            recvCounts[p] = distCounts[p];
+            displs[p] = totalRecv;
+            totalRecv += distCounts[p];
+        }
+    }
+
+    // Gather vertices
+    vector<int> allVertices(totalRecv);
+    MPI_Gatherv(sendVertices.data(), localDistCount, MPI_INT,
+                allVertices.data(), recvCounts.data(), displs.data(), MPI_INT,
+                0, MPI_COMM_WORLD);
+
+    // Gather distances
+    vector<double> allDistances(totalRecv);
+    MPI_Gatherv(sendDistances.data(), localDistCount, MPI_DOUBLE,
+                allDistances.data(), recvCounts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    // Process received distances
+    if (rank == 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < totalRecv; ++i) {
+            int v = allVertices[i];
+            double d = allDistances[i];
+            #pragma omp critical
+            {
+                globalDist[v] = min(globalDist[v], d);
+            }
+        }
+
+        // Write distances
+        ofstream out("distances.txt");
+        for (int v = 0; v < numVertices; ++v) {
+            if (globalDist[v] != numeric_limits<double>::infinity()) {
+                out << v << " " << globalDist[v] << endl;
+            }
+        }
+        out.close();
+        cout << "Distances saved to distances.txt" << endl;
+    }
+
+    // Final execution time summary
+    if (rank == 0) {
+        double megaEnd = MPI_Wtime();
+        double totalExecutionTime = (megaEnd - megaStart) * 1000000.0; // Convert to microseconds
+        cout << "\nFinal Execution Time Summary:" << endl;
+        cout << "-----------------------------" << endl;
+        cout << "Graph loading time:          " << (end - start) * 1000.0 << " ms" << endl;
+        cout << "Initial SSSP computation:    " << (end - start) * 1000.0 << " ms" << endl;
+        cout << "Total dynamic updates:       " << totalUpdateTime << " ms" << endl;
+       // cout << "Average dynamic update:      " << totalUpdateTime / changes.size() << " ms" << endl;
+        //cout << "Total time of execution is   " << totalExecutionTime << " s" << endl;
+    }
 
     MPI_Finalize();
     return 0;
